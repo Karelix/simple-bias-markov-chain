@@ -5,15 +5,15 @@
 ![Markets](https://img.shields.io/badge/markets-continuous_futures-orange)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-A simple but practical learning project for using **Markov chains** to study market regimes and build a basic **daily bias framework**.
+A simple but practical learning project for using **Markov chains** to study market regimes and build a basic **daily bias framework** for futures.
 
 The goal is not to predict the market perfectly.
 
 The goal is to answer a better question:
 
-> Given the current market state, what type of market state tends to come next?
+> Given the current market state, what type of market state has historically tended to come next?
 
-This project uses daily data from **Yahoo Finance** and can be applied to any continuous futures contract available there, such as `ES=F`, `NQ=F`, `CL=F`, `GC=F`, and more.
+This project currently uses daily data from **Yahoo Finance** and can be applied to any continuous futures contract available there, such as `ES=F`, `NQ=F`, `CL=F`, `GC=F`, and more.
 
 ---
 
@@ -59,11 +59,14 @@ how often is tomorrow also BALANCE?
 If today is UP_TREND,
 how often does the next day continue as UP_TREND?
 
+If today is DOWN_TREND,
+does the market tend to continue lower, reverse upward, or return to balance?
+
 If today is VOLATILE,
-does the market usually calm down or stay volatile?
+does the market usually calm down or remain volatile?
 ```
 
-This creates a simple **transition matrix** that can be used as a basic market-bias tool.
+This creates a simple **transition matrix** that can be used as a basic market-bias and auction-context tool.
 
 ---
 
@@ -74,16 +77,16 @@ A Markov chain is a model where the next state depends only on the current state
 In this project, that means:
 
 ```text
-Tomorrow's market regime depends on today's market regime.
+Tomorrow's market regime is studied as a function of today's market regime.
 ```
 
 Example:
 
 ```text
-BALANCE → BALANCE
-BALANCE → UP_TREND
-BALANCE → DOWN_TREND
-BALANCE → VOLATILE
+BALANCE -> BALANCE
+BALANCE -> UP_TREND
+BALANCE -> DOWN_TREND
+BALANCE -> VOLATILE
 ```
 
 The model counts these transitions historically and converts them into probabilities.
@@ -122,28 +125,43 @@ The workflow is simple:
 1. Download daily data from Yahoo Finance
 2. Calculate daily features
 3. Classify each day into a regime
-4. Build a Markov transition matrix
-5. Use the probabilities as a bias/context tool
+4. Build a Markov transition-count matrix
+5. Convert transition counts into transition probabilities
+6. Compare transition probabilities against the baseline state distribution
+7. Use the result as bias/context, not as a standalone trading signal
 ```
 
 ---
 
-## 🧪 Example Regime Logic
+## 🧪 Current Feature Logic
 
-Each day is classified using simple features such as:
+The project currently calculates:
 
+- Previous close
 - Daily return
-- Daily range
-- Close location inside the day’s range
-- Volatility relative to recent average range
+- Daily range percentage
+- Close location inside the day's range
+- True range
+- ATR(14)
+- True range as a percentage of previous close
+- ATR(14) as a percentage of previous close
 
-Example classification logic:
+The current regime logic is:
 
 ```text
-Strong positive return + close near high  → UP_TREND
-Strong negative return + close near low   → DOWN_TREND
-Large range with no clear direction       → VOLATILE
-Everything else                           → BALANCE
+Strong positive return + close near high -> UP_TREND
+Strong negative return + close near low  -> DOWN_TREND
+Large range without clear direction      -> VOLATILE
+Everything else                          -> BALANCE
+```
+
+Default thresholds in `src/markov.py`:
+
+```text
+return_threshold        = 0.003
+close_location_upper    = 0.60
+close_location_lower    = 0.40
+volatility_multiplier   = 1.5
 ```
 
 This logic is intentionally simple and should be adjusted during research.
@@ -155,12 +173,12 @@ This logic is intentionally simple and should be adjusted during research.
 The output may look something like this:
 
 ```text
-Next State       BALANCE   UP_TREND   DOWN_TREND   VOLATILE
-Current State
-BALANCE           54.2%      18.5%       16.1%       11.2%
-UP_TREND          43.8%      28.4%       12.7%       15.1%
-DOWN_TREND        45.3%      13.9%       25.6%       15.2%
-VOLATILE          48.6%      17.4%       18.2%       15.8%
+next_state   BALANCE  DOWN_TREND  UP_TREND  VOLATILE
+state
+BALANCE       0.4367      0.2204    0.3247    0.0182
+DOWN_TREND    0.3073      0.2639    0.3941    0.0347
+UP_TREND      0.4389      0.2228    0.3224    0.0159
+VOLATILE      0.4342      0.1711    0.3553    0.0395
 ```
 
 This can then be translated into a simple trading context.
@@ -168,15 +186,56 @@ This can then be translated into a simple trading context.
 Example:
 
 ```text
-If BALANCE has the highest probability:
-    Avoid chasing breakouts from the middle of the range.
+If UP_TREND continuation probability is below baseline:
+    Avoid blindly chasing upside continuation after a strong up day.
 
-If UP_TREND continuation probability is elevated:
-    Give more weight to long pullback setups.
+If DOWN_TREND -> UP_TREND is above baseline:
+    Be alert for a possible bounce or downside rejection the next day.
 
-If VOLATILE probability is elevated:
-    Reduce size and wait for better trade location.
+If VOLATILE has very few observations:
+    Treat that row as unstable until more data is available.
 ```
+
+---
+
+## 📐 Baseline And Edge
+
+The transition matrix is more useful when compared with the unconditional baseline.
+
+The baseline answers:
+
+```text
+How often does each state happen in general?
+```
+
+Example:
+
+```python
+df = markov_chain.classify_states(price_data_handler.prices)
+baseline = df["state"].value_counts(normalize=True)
+```
+
+The edge table answers:
+
+```text
+After a given state, is the next state more or less likely than usual?
+```
+
+Example:
+
+```python
+edge = markov_chain.transition_probs.subtract(baseline, axis=1)
+```
+
+Interpretation:
+
+```text
+Positive edge -> next state is more likely than usual after the current state
+Negative edge -> next state is less likely than usual after the current state
+Near zero     -> current state may not add much information
+```
+
+This helps separate real transition information from the market's normal state distribution.
 
 ---
 
@@ -185,37 +244,76 @@ If VOLATILE probability is elevated:
 Suppose yesterday was classified as:
 
 ```text
-BALANCE
+DOWN_TREND
 ```
 
 And the model shows:
 
 ```text
-After BALANCE:
-- BALANCE: 54%
-- UP_TREND: 18%
-- DOWN_TREND: 16%
-- VOLATILE: 12%
+After DOWN_TREND:
+- BALANCE:    below baseline
+- UP_TREND:   above baseline
+- DOWN_TREND: slightly above baseline
+- VOLATILE:   slightly above baseline
 ```
 
-Then the daily bias is not necessarily bullish or bearish.
+Then the daily bias is not simply bullish or bearish.
 
 Instead, the useful takeaway is:
 
 ```text
-The market has a higher probability of remaining rotational.
-Be careful chasing moves.
-Prioritize better location.
-Wait for confirmation.
+The market may be less likely to return to quiet balance immediately.
+Prepare for either a bounce/reversal or continued directional auction.
+Use price acceptance/rejection around key levels before acting.
 ```
 
-For an order-flow trader, this can help decide whether to:
+For an auction-market trader, this can help decide whether to:
 
-- Fade extremes
-- Trade continuation
-- Avoid the middle
-- Reduce size
-- Wait for stronger confirmation
+- Fade poor location
+- Trade continuation only after acceptance
+- Avoid chasing from the middle
+- Reduce size when context is unclear
+- Wait for confirmation around prior value, prior range, or session extremes
+
+---
+
+## 🧭 Auction Market Theory Direction
+
+The current model is candle-based and intentionally simple.
+
+For stronger Auction Market Theory research, future states should become more value-based.
+
+Useful future state ideas:
+
+- `BALANCE_INSIDE_VALUE`
+- `UP_ACCEPTANCE`
+- `DOWN_ACCEPTANCE`
+- `UP_REJECTION`
+- `DOWN_REJECTION`
+- `FAILED_BREAKOUT`
+- `VALUE_HIGHER`
+- `VALUE_LOWER`
+- `VALUE_OVERLAPPING`
+- `VOLATILE_EXPANSION`
+
+Important AMT features to add later:
+
+- Prior day high, low, close, and range
+- Prior value area high, value area low, and point of control
+- Opening location relative to prior value
+- Closing location relative to prior value
+- Value migration higher, lower, or overlapping
+- Multi-day balance highs and lows
+- Failed breaks above or below balance
+- RTH versus ETH session separation
+
+The long-term goal is for the Markov chain to study auction behavior such as:
+
+```text
+If price opens above prior value, does it accept higher or reject back inside?
+If value migrates higher today, does value keep migrating higher tomorrow?
+If price breaks a multi-day balance, does it continue or fail?
+```
 
 ---
 
@@ -225,15 +323,11 @@ For an order-flow trader, this can help decide whether to:
 simple-bias-markov-chain/
 │
 ├── data/                 # Optional local data storage
-├── notebooks/            # Research notebooks
 ├── src/                  # Core Python code
-│   ├── data_loader.py
-│   ├── features.py
-│   ├── regimes.py
-│   └── markov_chain.py
-│
-├── main.py
-├── requirements.txt
+│   ├── data_loader.py    # Downloads data and calculates features
+│   └── markov.py         # Classifies states and builds transition matrices
+├── main.py               # Example script / debugger entry point
+├── requirements.txt      # Python dependencies
 └── README.md
 ```
 
@@ -285,13 +379,6 @@ yfinance
 matplotlib
 ```
 
-Optional dependencies:
-
-```text
-jupyter
-seaborn
-```
-
 ---
 
 ## ▶️ Basic Usage
@@ -302,16 +389,29 @@ Run the main script:
 python main.py
 ```
 
-Or open the notebook:
+The current `main.py` downloads data, calculates features, fits the Markov model, and enters the debugger.
 
-```bash
-jupyter notebook
+Useful debugger checks:
+
+```python
+markov_chain.transition_counts
+markov_chain.transition_probs
 ```
 
-Change the symbol to test another market:
+To calculate the baseline and edge:
+
+```python
+df = markov_chain.classify_states(price_data_handler.prices)
+baseline = df["state"].value_counts(normalize=True)
+edge = markov_chain.transition_probs.subtract(baseline, axis=1)
+```
+
+Change the symbol or date range to test another market or period:
 
 ```python
 symbol = "ES=F"
+start_date = "2012-01-01"
+end_date = "2025-12-31"
 ```
 
 For example:
@@ -338,6 +438,8 @@ This project can help explore questions like:
 - Are some futures markets more rotational than others?
 - Can a simple regime model improve daily bias preparation?
 - Do certain setups perform better after specific regimes?
+- Does a current state still matter after comparing it to the baseline distribution?
+- Are the same transitions stable across different market periods?
 
 ---
 
@@ -346,12 +448,15 @@ This project can help explore questions like:
 Future improvements may include:
 
 - Add VIX data
-- Add NQ vs ES relative strength
+- Add NQ versus ES relative strength
 - Add overnight gap features
-- Add RTH vs ETH session separation
+- Add RTH versus ETH session separation
 - Add prior day high, low, close, and range context
-- Add volume-profile levels such as VAH, VAL, and POC
+- Add value-area levels such as VAH, VAL, and POC
+- Add value migration states
+- Add multi-day balance and failed-breakout states
 - Add order-flow features such as delta and volume imbalance
+- Add train/test or walk-forward validation
 - Upgrade to Hidden Markov Models
 - Backtest setup performance by regime
 
@@ -363,7 +468,15 @@ This project is for **education and research only**.
 
 Yahoo Finance data is useful for learning and prototyping, but it may not be clean enough for professional-grade futures research.
 
-For more serious futures research, consider using dedicated market data providers with clean historical futures data.
+For serious futures research, consider using dedicated market data providers with clean historical futures data, proper continuous-contract handling, and intraday/RTH session support.
+
+The transition matrix should not be treated as a direct buy/sell signal.
+
+It is better used as a context filter:
+
+```text
+Which auction playbook deserves more attention after today's state?
+```
 
 ---
 
@@ -406,4 +519,3 @@ Trading futures involves substantial risk.
 ## 📄 License
 
 This project is licensed under the MIT License.
-````
